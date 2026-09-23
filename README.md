@@ -24,8 +24,8 @@ flowchart LR
 
 - [x] Phase 1 — Calibrated ADT event simulator, Redpanda, topic setup
 - [x] Phase 2 — Stream processor: effectively-once state, event-time watermarks, dead-letter handling
-- [ ] Phase 3 — .NET API with SignalR live updates
-- [ ] Phase 4 — React live operations dashboard with alerts
+- [x] Phase 3 — .NET API with SignalR live updates
+- [x] Phase 4 — React live operations dashboard with alerts
 - [ ] Phase 5 — Arrival forecasting, CI, one-command setup
 
 ## Event schema (`adt.events`, key = `visit_id`)
