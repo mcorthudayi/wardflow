@@ -25,8 +25,6 @@ WARDS = {
 }
 TOTAL_BEDS = sum(ward["beds"] for ward in WARDS.values())
 ACUITY_WEIGHTS = [0.02, 0.15, 0.45, 0.30, 0.08]
-WARM_OCCUPANCY = 0.75
-WARM_ED_PATIENTS = 8
 
 
 @dataclass
@@ -40,9 +38,10 @@ class Visit:
 
 
 class Profile:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, min_admission_rate: float) -> None:
         self.data = json.loads(path.read_text(encoding="utf-8"))
-        self.admission_rate = self.data["ed_admission_rate"]["used"]
+        self.observed_admission_rate = self.data["ed_admission_rate"]["observed"]
+        self.admission_rate = max(self.data["ed_admission_rate"]["used"], min_admission_rate)
 
     def length_of_stay(self, encounter_class: str, rng: random.Random) -> timedelta:
         points = self.data["classes"][encounter_class]["los_minutes_quantiles"]
@@ -51,6 +50,13 @@ class Profile:
         upper = min(lower + 1, len(points) - 1)
         minutes = points[lower] + (points[upper] - points[lower]) * (position - lower)
         return timedelta(minutes=max(5.0, minutes))
+
+    def length_biased_stay(self, encounter_class: str, rng: random.Random) -> timedelta:
+        ceiling = self.data["classes"][encounter_class]["los_minutes_quantiles"][-1]
+        while True:
+            stay = self.length_of_stay(encounter_class, rng)
+            if rng.random() * ceiling <= stay.total_seconds() / 60:
+                return stay
 
     def mean_length_of_stay(self, encounter_class: str) -> timedelta:
         points = self.data["classes"][encounter_class]["los_minutes_quantiles"]
@@ -84,6 +90,7 @@ class Simulator:
         start: datetime,
         ed_per_day: float,
         direct_per_day: float,
+        warm_occupancy: float,
         emit: Callable[[dict], None],
     ) -> None:
         self.profile = profile
@@ -92,6 +99,7 @@ class Simulator:
         self.clock = start
         self.ed_per_day = ed_per_day
         self.direct_per_day = direct_per_day
+        self.warm_occupancy = warm_occupancy
         self.emit = emit
         self.queue: list = []
         self.sequence = itertools.count()
@@ -135,18 +143,18 @@ class Simulator:
         self.counts[event_type] += 1
         self.emit(record)
 
-    def warm_start(self) -> None:
+    def warm_start(self, ed_patients: int) -> None:
         for code, ward in WARDS.items():
-            for _ in range(int(ward["beds"] * WARM_OCCUPANCY)):
+            for _ in range(min(ward["beds"], round(ward["beds"] * self.warm_occupancy))):
                 visit = Visit(self.new_id("v"), self.new_id("p"), code)
-                stay = self.profile.length_of_stay("IMP", self.rng)
+                stay = self.profile.length_biased_stay("IMP", self.rng)
                 elapsed = stay * self.rng.random()
                 visit.bed = self.free_beds[code].pop()
                 self.publish("A01", "admit", self.start - elapsed, visit, bed=visit.bed, source="census")
                 self.schedule(self.start + (stay - elapsed), "inpatient_discharge", visit)
-        for _ in range(WARM_ED_PATIENTS):
+        for _ in range(ed_patients):
             visit = Visit(self.new_id("v"), self.new_id("p"), "ED", acuity=self.acuity())
-            stay = self.profile.length_of_stay("EMER", self.rng)
+            stay = self.profile.length_biased_stay("EMER", self.rng)
             elapsed = stay * self.rng.random()
             self.ed_census += 1
             self.publish("A04", "register", self.start - elapsed, visit, acuity=visit.acuity, source="census")
@@ -311,8 +319,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topic", default=os.getenv("WARDFLOW_TOPIC", "adt.events"))
     parser.add_argument("--speed", type=float, default=600.0)
     parser.add_argument("--sim-hours", type=float, default=0.0)
-    parser.add_argument("--ed-per-day", type=float, default=70.0)
+    parser.add_argument("--ed-per-day", type=float, default=90.0)
     parser.add_argument("--target-occupancy", type=float, default=0.85)
+    parser.add_argument("--min-admission-rate", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-warm-start", action="store_true")
@@ -321,16 +330,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    profile = Profile(args.profile)
+    target_occupancy = min(max(args.target_occupancy, 0.05), 1.0)
+    profile = Profile(args.profile, args.min_admission_rate)
     rng = random.Random(args.seed)
     start = datetime.now(timezone.utc).replace(microsecond=0)
 
     inpatient_days = profile.mean_length_of_stay("IMP").total_seconds() / 86400
     ed_hours = profile.mean_length_of_stay("EMER").total_seconds() / 3600
     ed_admissions = args.ed_per_day * profile.admission_rate
-    needed_admissions = args.target_occupancy * TOTAL_BEDS / inpatient_days
+    needed_admissions = target_occupancy * TOTAL_BEDS / inpatient_days
     direct_per_day = max(0.0, needed_admissions - ed_admissions)
     expected_occupancy = (ed_admissions + direct_per_day) * inpatient_days / TOTAL_BEDS
+    ed_warm_patients = round(args.ed_per_day * ed_hours / 24)
 
     sink = StdoutSink() if args.dry_run else KafkaSink(args.brokers, args.topic)
     stop = {"requested": False}
@@ -341,9 +352,13 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
-    simulator = Simulator(profile, rng, start, args.ed_per_day, direct_per_day, sink)
+    simulator = Simulator(profile, rng, start, args.ed_per_day, direct_per_day, target_occupancy, sink)
+    last_reported: dict[str, datetime | None] = {"clock": None}
 
     def report(sim: Simulator) -> None:
+        if last_reported["clock"] == sim.clock:
+            return
+        last_reported["clock"] = sim.clock
         occupied = sim.occupied_beds()
         print(
             f"[{sim.clock:%Y-%m-%d %H:%M}] ED census {sim.ed_census:3d} | "
@@ -355,14 +370,15 @@ def main() -> int:
     target = "stdout" if args.dry_run else f"{args.brokers}/{args.topic}"
     print(f"WardFlow simulator -> {target} | speed x{args.speed:g}", file=sys.stderr)
     print(
-        f"ED {args.ed_per_day:g}/day (mean stay {ed_hours:.1f} h) | admission rate {profile.admission_rate:.0%} | "
+        f"ED {args.ed_per_day:g}/day (mean stay {ed_hours:.1f} h) | "
+        f"admission rate {profile.admission_rate:.0%} (observed {profile.observed_admission_rate:.1%}) | "
         f"direct admissions {direct_per_day:.1f}/day | inpatient mean stay {inpatient_days:.1f} d | "
         f"expected occupancy {expected_occupancy:.0%}",
         file=sys.stderr,
     )
 
     if not args.no_warm_start:
-        simulator.warm_start()
+        simulator.warm_start(ed_warm_patients)
     until = start + timedelta(hours=args.sim_hours) if args.sim_hours > 0 else None
 
     try:
