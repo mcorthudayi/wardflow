@@ -1,7 +1,9 @@
 import {
   Area,
   AreaChart,
+  Bar,
   CartesianGrid,
+  ComposedChart,
   Legend,
   Line,
   LineChart,
@@ -11,7 +13,7 @@ import {
   YAxis
 } from 'recharts'
 import { useOps, type LinkState } from './useOps'
-import type { Alert, BoardingPatient, RecentEvent, UnitStatus } from './types'
+import type { Alert, BoardingPatient, Forecast, RecentEvent, UnitStatus } from './types'
 
 type Tone = 'ok' | 'warn' | 'crit'
 
@@ -189,6 +191,11 @@ export default function App() {
             <h2>Live event stream</h2>
             <EventFeed events={overview?.recentEvents ?? []} />
           </div>
+
+          <div className="card" style={{ gridColumn: '1 / -1' }}>
+            <h2>ED arrivals · actual vs forecast</h2>
+            <ForecastChart forecast={overview?.forecast ?? null} />
+          </div>
         </section>
       </main>
 
@@ -295,5 +302,53 @@ function EventFeed({ events }: { events: RecentEvent[] }) {
         </li>
       ))}
     </ul>
+  )
+}
+
+function ForecastChart({ forecast }: { forecast: Forecast | null }) {
+  if (!forecast || !forecast.ready) {
+    return (
+      <p className="muted">
+        The forecast warms up after 3 hours of simulated arrivals
+        {forecast ? ` (${forecast.historyHours} h so far)` : ''}.
+      </p>
+    )
+  }
+
+  const data = [
+    ...forecast.history.map(point => ({
+      time: clock(point.hourStart),
+      actual: point.actual,
+      fitted: point.expected,
+      range: [point.low, point.high]
+    })),
+    ...forecast.next.map(point => ({
+      time: clock(point.hourStart),
+      forecast: point.expected,
+      range: [point.low, point.high]
+    }))
+  ]
+
+  return (
+    <>
+      <p className="muted" style={{ margin: '0 0 12px', fontSize: 13 }}>
+        Seasonal Poisson model: hour-of-day and weekday shape calibrated on Synthea, level re-estimated from the last{' '}
+        {forecast.historyHours} h ({forecast.dailyRate} arrivals/day). Mean absolute error over the last 12 h:{' '}
+        {forecast.mae ?? '—'} arrivals/h. Shaded band: 80% interval.
+      </p>
+      <ResponsiveContainer width="100%" height={240}>
+        <ComposedChart data={data} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
+          <CartesianGrid stroke="#1e293b" vertical={false} />
+          <XAxis dataKey="time" stroke="#64748b" fontSize={12} />
+          <YAxis stroke="#64748b" fontSize={12} allowDecimals={false} />
+          <Tooltip contentStyle={TOOLTIP_STYLE} />
+          <Legend wrapperStyle={{ fontSize: 12 }} />
+          <Area type="monotone" dataKey="range" name="80% interval" stroke="none" fill="#38bdf8" fillOpacity={0.15} isAnimationActive={false} />
+          <Bar dataKey="actual" name="Actual arrivals" fill="#22c55e" barSize={18} isAnimationActive={false} />
+          <Line type="monotone" dataKey="fitted" name="Model fit" stroke="#94a3b8" strokeDasharray="4 4" dot={false} isAnimationActive={false} />
+          <Line type="monotone" dataKey="forecast" name="Forecast" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </>
   )
 }

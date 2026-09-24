@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pipeline:
+    name: End-to-end stream pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      WARDFLOW_BROKERS: 127.0.0.1:19092
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            simulator/requirements.txt
+            processor/requirements.txt
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install Python dependencies
+        run: pip install -r simulator/requirements.txt -r processor/requirements.txt
+
+      - name: Create environment with random passwords
+        run: |
+          {
+            echo "POSTGRES_USER=wardflow"
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+            echo "POSTGRES_DB=wardflow"
+            echo "POSTGRES_HOST=localhost"
+            echo "POSTGRES_PORT=5434"
+            echo "WARDFLOW_BROKERS=127.0.0.1:19092"
+            echo "WARDFLOW_TOPIC=adt.events"
+            echo "API_DB_PASSWORD=$(openssl rand -hex 24)"
+          } > .env
+
+      - name: Start Redpanda and PostgreSQL
+        run: docker compose up -d --wait redpanda postgres
+
+      - name: Reset stream and state
+        run: ./scripts/reset.sh
+
+      - name: Simulate 72 hours of hospital activity
+        run: python simulator/simulate.py --speed 0 --sim-hours 72 --seed 7
+
+      - name: Process the stream
+        run: python processor/processor.py --once --idle-seconds 5
+
+      - name: Check state invariants
+        run: ./scripts/check_invariants.sh
+
+      - name: Replay the whole topic
+        run: ./scripts/replay_check.sh
+
+      - name: Route a malformed event to the dead-letter table
+        run: |
+          echo 'not even json' | docker exec -i wardflow-redpanda rpk topic produce adt.events -k broken
+          python processor/processor.py --once --idle-seconds 5
+          test "$(docker exec wardflow-postgres psql -At -U wardflow -d wardflow -c 'SELECT count(*) FROM ops.dead_letter')" = "1"
+
+      - name: Create read-only API role
+        run: ./scripts/setup_api_role.sh
+
+      - name: Start API
+        run: |
+          nohup ./scripts/api.sh > api.log 2>&1 &
+          for _ in $(seq 1 90); do
+            curl -sf http://localhost:5090/health > /dev/null && exit 0
+            sleep 2
+          done
+          cat api.log
+          exit 1
+
+      - name: Smoke tests
+        run: python scripts/smoke_test.py
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          cat api.log || true
+          docker compose logs --tail 100
+
+  dashboard:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Check NuGet packages for known vulnerabilities
+        run: |
+          dotnet restore api/WardFlow.Api
+          dotnet list api/WardFlow.Api package --vulnerable --include-transitive | tee vulnerable.txt
+          ! grep -q "has the following vulnerable packages" vulnerable.txt

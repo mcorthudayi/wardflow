@@ -12,3 +12,10 @@ obj/
 .DS_Store
 .idea/
 .vscode/
+.pids/
+dashboard/node_modules/
+dashboard/dist/
+api/**/bin/
+api/**/obj/
+vulnerable.txt
+api.log

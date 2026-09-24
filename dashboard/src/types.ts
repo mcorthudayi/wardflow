@@ -41,6 +41,24 @@ export interface RecentEvent {
   status: string
 }
 
+export interface ForecastPoint {
+  hourStart: string
+  expected: number
+  low: number
+  high: number
+  actual: number | null
+}
+
+export interface Forecast {
+  ready: boolean
+  asOf: string | null
+  historyHours: number
+  dailyRate: number | null
+  mae: number | null
+  history: ForecastPoint[]
+  next: ForecastPoint[]
+}
+
 export interface Overview {
   simTime: string | null
   latest: Snapshot | null
@@ -48,6 +66,7 @@ export interface Overview {
   alerts: Alert[]
   boarding: BoardingPatient[]
   recentEvents: RecentEvent[]
+  forecast: Forecast
   deadLetters: number
   eventsProcessed: number
 }
